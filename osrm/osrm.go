@@ -1,62 +1,189 @@
 // Package osrm is the library behind the osrm command line:
-// the HTTP client, request shaping, and the typed data models for osrm.
+// the HTTP client, request shaping, and the typed data models for the
+// OSRM (Open Source Routing Machine) demo server (router.project-osrm.org).
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// The client is polite: it sets a real User-Agent, paces requests, and
+// retries transient failures (429 and 5xx). OSRM uses (longitude, latitude)
+// coordinate order in URLs; the public API accepts the more natural (lat, lon)
+// and swaps internally.
 package osrm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to osrm. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "osrm/dev (+https://github.com/tamnd/osrm-cli)"
-
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at osrm.com; change it once you
-// know the real endpoints you want to read.
-const Host = "osrm.com"
+// Host is the OSRM demo server hostname.
+const Host = "router.project-osrm.org"
 
 // BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+const BaseURL = "http://" + Host
 
-// Client talks to osrm over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// DefaultUserAgent identifies the client. Honest, descriptive, contact included.
+const DefaultUserAgent = "osrm-cli/0.1 (tamnd87@gmail.com)"
+
+// Config holds all tunable parameters for the Client.
+type Config struct {
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// DefaultConfig returns a Config with sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   BaseURL,
 		UserAgent: DefaultUserAgent,
 		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Timeout:   30 * time.Second,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to the OSRM demo server over HTTP.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	last time.Time
+}
+
+// NewClient returns a Client configured with cfg.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// Route finds the driving (or cycling/walking) route between two or more
+// waypoints. coords is a slice of "lat,lon" strings; mode is "driving",
+// "cycling", or "walking".
+func (c *Client) Route(ctx context.Context, coords []string, mode string) ([]Route, error) {
+	osrmCoords, err := parseCoords(coords)
+	if err != nil {
+		return nil, err
+	}
+	url := fmt.Sprintf("%s/route/v1/%s/%s?overview=false&steps=false",
+		c.cfg.BaseURL, mode, strings.Join(osrmCoords, ";"))
+	body, err := c.get(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	var resp wireRouteResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode route response: %w", err)
+	}
+	if resp.Code != "Ok" {
+		return nil, fmt.Errorf("osrm error: %s", resp.Code)
+	}
+	out := make([]Route, 0, len(resp.Routes))
+	for i, r := range resp.Routes {
+		out = append(out, Route{
+			Index:    i,
+			Distance: r.Distance / 1000,
+			Duration: r.Duration / 60,
+			Legs:     len(r.Legs),
+		})
+	}
+	return out, nil
+}
+
+// Nearest finds the nearest road segment(s) to a single "lat,lon" coordinate.
+// count controls how many candidates are returned (default 1).
+func (c *Client) Nearest(ctx context.Context, coord string, count int, mode string) ([]NearestPoint, error) {
+	osrmCoord, err := parseCoord(coord)
+	if err != nil {
+		return nil, err
+	}
+	if count <= 0 {
+		count = 1
+	}
+	url := fmt.Sprintf("%s/nearest/v1/%s/%s?number=%d",
+		c.cfg.BaseURL, mode, osrmCoord, count)
+	body, err := c.get(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	var resp wireNearestResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode nearest response: %w", err)
+	}
+	if resp.Code != "Ok" {
+		return nil, fmt.Errorf("osrm error: %s", resp.Code)
+	}
+	out := make([]NearestPoint, 0, len(resp.Waypoints))
+	for _, wp := range resp.Waypoints {
+		name := wp.Name
+		if name == "" {
+			name = fmt.Sprintf("%.6f,%.6f", wp.Location[1], wp.Location[0])
+		}
+		out = append(out, NearestPoint{
+			Name:     name,
+			Distance: wp.Distance,
+			Lon:      wp.Location[0],
+			Lat:      wp.Location[1],
+		})
+	}
+	return out, nil
+}
+
+// Table computes the distance and duration matrix between all provided
+// "lat,lon" coordinates. coords must have at least 2 entries.
+func (c *Client) Table(ctx context.Context, coords []string, mode string) ([]MatrixRow, error) {
+	if len(coords) < 2 {
+		return nil, fmt.Errorf("table requires at least 2 coordinates")
+	}
+	osrmCoords, err := parseCoords(coords)
+	if err != nil {
+		return nil, err
+	}
+	url := fmt.Sprintf("%s/table/v1/%s/%s?annotations=distance,duration",
+		c.cfg.BaseURL, mode, strings.Join(osrmCoords, ";"))
+	body, err := c.get(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	var resp wireTableResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode table response: %w", err)
+	}
+	if resp.Code != "Ok" {
+		return nil, fmt.Errorf("osrm error: %s", resp.Code)
+	}
+	n := len(coords)
+	var out []MatrixRow
+	for i := 0; i < n; i++ {
+		for j := 0; j < n; j++ {
+			var dist, dur float64
+			if i < len(resp.Distances) && j < len(resp.Distances[i]) {
+				dist = resp.Distances[i][j] / 1000
+			}
+			if i < len(resp.Durations) && j < len(resp.Durations[i]) {
+				dur = resp.Durations[i][j] / 60
+			}
+			out = append(out, MatrixRow{
+				From:     i,
+				To:       j,
+				Distance: dist,
+				Duration: dur,
+			})
+		}
+	}
+	return out, nil
+}
+
+// get fetches a URL with pacing and retries. The caller owns nothing;
+// the body is read fully and closed here.
+func (c *Client) get(ctx context.Context, url string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -82,9 +209,9 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -106,10 +233,10 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 
 // pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -123,78 +250,89 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on osrm.com. It is a stand-in for the typed records you
-// will model from the real osrm endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `osrm cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// --- coordinate helpers ---
+
+// parseCoord parses a "lat,lon" string into the "lon,lat" OSRM URL format.
+func parseCoord(s string) (string, error) {
+	parts := strings.SplitN(strings.TrimSpace(s), ",", 2)
+	if len(parts) != 2 {
+		return "", fmt.Errorf("expected lat,lon got %q", s)
+	}
+	lat := strings.TrimSpace(parts[0])
+	lon := strings.TrimSpace(parts[1])
+	return lon + "," + lat, nil // OSRM needs lon,lat
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
+// parseCoords parses a slice of "lat,lon" strings into OSRM "lon,lat" format.
+func parseCoords(coords []string) ([]string, error) {
+	out := make([]string, 0, len(coords))
+	for _, c := range coords {
+		osrm, err := parseCoord(c)
+		if err != nil {
+			return nil, err
 		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+		out = append(out, osrm)
 	}
 	return out, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
+// --- output types ---
 
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
+// Route is one computed route between two or more waypoints.
+type Route struct {
+	Index    int     `kit:"id"      json:"index"`
+	Distance float64 `json:"distance_km"`
+	Duration float64 `json:"duration_min"`
+	Legs     int     `json:"legs"`
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
+// NearestPoint is the nearest road point to a queried coordinate.
+type NearestPoint struct {
+	Name     string  `kit:"id" json:"name"`
+	Distance float64 `json:"distance_m"`
+	Lon      float64 `json:"lon"`
+	Lat      float64 `json:"lat"`
+}
+
+// MatrixRow is one cell in the distance/duration matrix.
+type MatrixRow struct {
+	From     int     `kit:"id" json:"from"`
+	To       int     `json:"to"`
+	Distance float64 `json:"distance_km"`
+	Duration float64 `json:"duration_min"`
+}
+
+// --- wire types (OSRM JSON shapes) ---
+
+type wireRouteResp struct {
+	Code   string      `json:"code"`
+	Routes []wireRoute `json:"routes"`
+}
+
+type wireRoute struct {
+	Distance float64   `json:"distance"` // meters
+	Duration float64   `json:"duration"` // seconds
+	Legs     []wireLeg `json:"legs"`
+}
+
+type wireLeg struct {
+	Distance float64 `json:"distance"`
+	Duration float64 `json:"duration"`
+}
+
+type wireNearestResp struct {
+	Code      string          `json:"code"`
+	Waypoints []wireWaypoint  `json:"waypoints"`
+}
+
+type wireWaypoint struct {
+	Name     string    `json:"name"`
+	Distance float64   `json:"distance"`
+	Location []float64 `json:"location"` // [lon, lat]
+}
+
+type wireTableResp struct {
+	Code      string      `json:"code"`
+	Durations [][]float64 `json:"durations"`
+	Distances [][]float64 `json:"distances"`
 }
