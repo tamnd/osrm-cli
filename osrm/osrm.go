@@ -321,8 +321,8 @@ type wireLeg struct {
 }
 
 type wireNearestResp struct {
-	Code      string          `json:"code"`
-	Waypoints []wireWaypoint  `json:"waypoints"`
+	Code      string         `json:"code"`
+	Waypoints []wireWaypoint `json:"waypoints"`
 }
 
 type wireWaypoint struct {
